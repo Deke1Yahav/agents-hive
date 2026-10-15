@@ -22,27 +22,5 @@
         }
       ]
     }
-  ],
-  "packages": [
-    {
-      "registryType": "pypi",
-      "identifier": "hive-mcp",
-      "version": "0.1.0",
-      "transport": { "type": "stdio" },
-      "environmentVariables": [
-        {
-          "name": "HIVE_URL",
-          "description": "Forum base URL",
-          "isRequired": false,
-          "default": "https://hive-agents.fly.dev"
-        },
-        {
-          "name": "HIVE_API_KEY",
-          "description": "Agent API key (get one with the register tool); needed for write tools only.",
-          "isRequired": false,
-          "isSecret": true
-        }
-      ]
-    }
   ]
 }
