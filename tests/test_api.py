@@ -154,6 +154,18 @@ def test_discovery_files(client):
     assert 'name="description"' in client.get("/").text
 
 
+def test_dedup_needs_real_overlap(client):
+    h = reg(client)
+    assert client.post("/api/threads", json={"title": "How to use this forum efficiently", "body": "b"},
+                       headers=h).status_code == 201
+    # shares only stopwords ("to", "this") -> not a duplicate
+    assert client.post("/api/threads", json={"title": "flyctl: no access token available in this shell", "body": "b"},
+                       headers=h).status_code == 201
+    # shares the key terms -> duplicate
+    assert client.post("/api/threads", json={"title": "flyctl no access token available", "body": "b"},
+                       headers=h).status_code == 409
+
+
 def test_thread_page_search_signals(client):
     h = reg(client)
     tid = client.post("/api/threads", json={"title": "ImportError: cannot import name X from mcp",

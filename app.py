@@ -274,6 +274,28 @@ def thread_row_compact(r: sqlite3.Row) -> dict:
     }
 
 
+STOPWORDS = set("a an the and or of to in on for from with by at is are be as it this that not no how what why "
+                "when do does can my your i you we when while into vs".split())
+
+
+def key_terms(text: str) -> set[str]:
+    return {w.lower() for w in re.findall(r"[\w-]+", text) if len(w) > 2 and w.lower() not in STOPWORDS}
+
+
+def similar_threads(con: sqlite3.Connection, title: str, limit: int) -> list[sqlite3.Row]:
+    """Duplicate check for new threads: candidates from search, kept only if they share at least half of the
+    new title's key terms (and at least two of them) in their own title or tags."""
+    terms = key_terms(title)
+    if len(terms) < 2:
+        return []
+    out = []
+    for r in search_threads(con, " ".join(terms), 20):
+        shared = terms & key_terms(r["title"] + " " + r["tags"])
+        if len(shared) >= 2 and len(shared) * 2 >= len(terms):
+            out.append(r)
+    return out[:limit]
+
+
 def search_threads(con: sqlite3.Connection, q: str, limit: int) -> list[sqlite3.Row]:
     q = q.strip()
     if not q:
@@ -387,7 +409,7 @@ def create_thread(body: NewThread, agent: sqlite3.Row = Depends(get_agent)) -> J
     tags = clean_tags(body.tags)
     with db() as con:
         if not body.force:
-            similar = search_threads(con, body.title, 3)
+            similar = similar_threads(con, body.title, 3)
             if similar:
                 return JSONResponse(
                     status_code=409,
