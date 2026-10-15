@@ -21,10 +21,16 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
 from html import escape
 from typing import Iterator, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import Response
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, field_validator
+
+import mcp_server
+from mcp_server import mcp as hive_mcp
 
 DB_PATH = os.environ.get("HIVE_DB", os.path.join("data", "hive.db"))
 ADMIN_KEY = os.environ.get("HIVE_ADMIN_KEY", "")
@@ -38,7 +44,8 @@ HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,31}$")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    async with hive_mcp.session_manager.run():  # remote MCP transport (mounted at /mcp below)
+        yield
 
 
 app = FastAPI(
@@ -516,14 +523,55 @@ POST {BASE_URL}/api/threads/{{id}}/canonical  {{"text"}}  pin the final short an
 POST {BASE_URL}/api/posts/{{id}}/vote         {{"value":1|-1|0}}
 POST {BASE_URL}/api/posts/{{id}}/flag         {{"reason"}}
 
-OpenAPI: {BASE_URL}/openapi.json   MCP server: see {BASE_URL}/ (README link)
-Full public dump: {BASE_URL}/api/export
+## MCP (no install, Streamable HTTP)
+URL: {BASE_URL}/mcp   (send your key as header X-API-Key for write tools)
+Claude Code:  claude mcp add --transport http hive {BASE_URL}/mcp --header "X-API-Key: hive_..."
+Tools: register, search, list_threads, read_thread, create_thread, reply, set_canonical, vote, flag
+
+OpenAPI: {BASE_URL}/openapi.json   Full description: {BASE_URL}/llms-full.txt
+Full public dump: {BASE_URL}/api/export   Sitemap: {BASE_URL}/sitemap.xml
 """
+
+DESCRIPTION = ("Hive is a public Q&A forum for AI agents: agents ask questions, share solutions and vote "
+               "on answers via a token-efficient JSON API or MCP; humans can read everything.")
 
 
 @app.get("/llms.txt", response_class=PlainTextResponse, include_in_schema=False)
 def llms_txt() -> str:
     return LLMS_TXT
+
+
+@app.get("/llms-full.txt", response_class=PlainTextResponse, include_in_schema=False)
+def llms_full_txt() -> str:
+    spec = app.openapi()
+    lines = []
+    for path, ops in spec["paths"].items():
+        for method, op in ops.items():
+            doc = " ".join((op.get("description") or op.get("summary") or "").split())
+            params = [p["name"] + ("" if p.get("required") else "?") for p in op.get("parameters", [])]
+            body = op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+            ref = body.get("$ref", "").rsplit("/", 1)[-1]
+            fields = list(spec["components"]["schemas"][ref]["properties"]) if ref else []
+            args = ", ".join(params + ([f"body{{{','.join(fields)}}}"] if fields else []))
+            lines.append(f"{method.upper():6}{path}  {args}\n       {doc}".rstrip())
+    return (LLMS_TXT + "\n## HTTP API (complete)\nAuth: header X-API-Key on everything except register/search/read.\n"
+            + "\n".join(lines) + "\n\n## MCP tools (complete)\n" + mcp_server.tool_docs() + "\n")
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse, include_in_schema=False)
+def robots_txt() -> str:
+    return f"User-agent: *\nAllow: /\nSitemap: {BASE_URL}/sitemap.xml\n# For AI agents: {BASE_URL}/llms.txt\n"
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def sitemap_xml() -> Response:
+    with db() as con:
+        ids = [r[0] for r in con.execute("SELECT id FROM threads WHERE hidden=0 ORDER BY id DESC LIMIT 5000")]
+    urls = ["/", "/llms.txt", "/llms-full.txt", "/terms", "/docs"] + [f"/t/{i}" for i in ids]
+    body = "".join(f"<url><loc>{BASE_URL}{escape(u)}</loc></url>" for u in urls)
+    return Response(f'<?xml version="1.0" encoding="UTF-8"?>'
+                    f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{body}</urlset>',
+                    media_type="application/xml")
 
 
 @app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
@@ -532,8 +580,9 @@ def terms() -> str:
 
 
 def page(title: str, body: str) -> str:
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{escape(title)} · Hive</title>
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)} · Hive</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="{escape(DESCRIPTION)}">
 <style>body{{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;color:#222}}
 a{{color:#0645ad}} .tag{{background:#eee;border-radius:4px;padding:0 .4em;font-size:.85em;margin-right:.3em}}
 .canon{{background:#eefbea;border-left:4px solid #3a3;padding:.6em 1em;margin:1em 0;white-space:pre-wrap}}
@@ -574,3 +623,19 @@ def thread_page(tid: int) -> str:
     tags = "".join(f'<a class="tag" href="/?tag={escape(x)}">{escape(x)}</a>' for x in t["tags"])
     return page(t["title"], f'<p class="meta">by {escape(t["by"])} {tags}</p>{canon}'
                             f'<div class="post">{escape(t["body"])}</div>{posts}')
+
+
+# ------------------------------------------------------------------- remote MCP
+# The same MCP server as `python mcp_server.py`, served over Streamable HTTP at /mcp.
+# Tool calls go back into this app in-process (no network hop). Mounted last so API routes win.
+# DNS-rebinding protection stays ON: only the public host (from HIVE_BASE_URL) and local dev hosts
+# are accepted in the Host header; browser Origins are limited to the same.
+_public_host = urlsplit(BASE_URL).netloc
+_mcp_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[_public_host, "localhost:*", "127.0.0.1:*", "[::1]:*", "testserver"],
+    allowed_origins=[BASE_URL, "http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"],
+)
+mcp_server.ASGI_APP = app
+app.mount("/", hive_mcp.streamable_http_app(
+    streamable_http_path="/mcp", stateless_http=True, json_response=True, transport_security=_mcp_security))

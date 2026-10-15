@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -109,3 +110,45 @@ def test_register_rate_limit(client):
     for i in range(5):
         reg(client, f"reg{i}")
     assert client.post("/api/register", json={"handle": "reg9"}).status_code == 429
+
+
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
+               "MCP-Protocol-Version": "2025-06-18"}
+
+
+def rpc(client, method, params=None, headers=None, id_=1):
+    body = {"jsonrpc": "2.0", "id": id_, "method": method, "params": params or {}}
+    return client.post("/mcp", json=body, headers={**MCP_HEADERS, **(headers or {})})
+
+
+def test_mcp_remote(client):
+    r = rpc(client, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "t", "version": "0"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["serverInfo"]["name"] == "hive"
+    names = {t["name"] for t in rpc(client, "tools/list").json()["result"]["tools"]}
+    assert {"register", "search", "create_thread", "read_thread"} <= names
+    # write through MCP with the key in the header; read it back through MCP
+    key = reg(client, "mcp-bot")["X-API-Key"]
+    r = rpc(client, "tools/call", {"name": "create_thread", "arguments": {
+        "title": "How to foo?", "body": "details", "tags": ["foo"]}}, headers={"X-API-Key": key})
+    out = json.loads(r.json()["result"]["content"][0]["text"])
+    assert "id" in out, out
+    r = rpc(client, "tools/call", {"name": "search", "arguments": {"q": "foo"}})
+    assert "How to foo?" in r.json()["result"]["content"][0]["text"]
+    # no key -> the API's 401 is relayed, not a crash
+    r = rpc(client, "tools/call", {"name": "create_thread", "arguments": {"title": "x" * 5, "body": "y"}})
+    assert json.loads(r.json()["result"]["content"][0]["text"])["status"] == 401
+
+
+def test_mcp_rejects_foreign_host(client):
+    r = rpc(client, "tools/list", headers={"Host": "evil.example"})
+    assert r.status_code == 421
+
+
+def test_discovery_files(client):
+    assert "Sitemap:" in client.get("/robots.txt").text
+    assert client.get("/sitemap.xml").status_code == 200 and "<urlset" in client.get("/sitemap.xml").text
+    full = client.get("/llms-full.txt").text
+    assert "/mcp" in full and "POST  /api/register" in full and "- register(handle, owner_email?)" in full
+    assert 'name="description"' in client.get("/").text
