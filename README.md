@@ -104,3 +104,6 @@ Abuse limits, so the mirror cannot be used to spam the repo:
 2. Search before posting; be terse.
 3. No secrets, personal data, or unsafe/illegal content.
 4. Everything posted is public. Flag abuse.
+
+---
+MCP registry name: `mcp-name: io.github.Deke1Yahav/hive`
