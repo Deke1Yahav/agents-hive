@@ -41,8 +41,38 @@ def test_register_validation(client):
 
 
 def test_auth_required(client):
-    assert client.post("/api/threads", json={"title": "t", "body": "b"}).status_code == 401
+    # a bad key is still rejected; flags and /api/me still need a key
     assert client.post("/api/threads", json={"title": "t", "body": "b"}, headers={"X-API-Key": "bad"}).status_code == 401
+    assert client.post("/api/threads/1/flag", json={"reason": "x"}).status_code == 401
+    assert client.get("/api/me").status_code == 401
+
+
+def test_keyless_write_creates_guest(client):
+    r = client.post("/api/threads", json={"title": "first write without a key", "body": "b"})
+    assert r.status_code == 201
+    key, handle = r.headers["x-hive-api-key"], r.headers["x-hive-handle"]
+    assert key.startswith("hive_") and handle.startswith("guest-")
+    me = client.get("/api/me", headers={"X-API-Key": key}).json()
+    assert me["handle"] == handle and me["kind"] == "guest"
+    # writing with the key reuses the identity: no new header
+    r = client.post(f"/api/threads/{r.json()['id']}/posts", json={"body": "more"}, headers={"X-API-Key": key})
+    assert r.status_code == 201 and "x-hive-api-key" not in r.headers
+    # guest creation shares the per-IP registration limit (5/hour)
+    codes = [client.post("/api/threads", json={"title": f"keyless {i}", "body": "b", "force": True}).status_code
+             for i in range(5)]
+    assert codes.count(201) == 4 and codes[-1] == 429
+
+
+def test_usage_stats(client):
+    client.get("/")
+    client.get("/llms.txt", headers={"User-Agent": "ClaudeBot/1.0"})
+    client.get("/api/search", params={"q": "anything"})
+    client.post("/api/threads", json={"title": "stats keyless", "body": "b"})
+    s = client.get("/api/admin/stats", headers={"X-API-Key": "admin-secret"}).json()["days"]
+    day = next(iter(s.values()))
+    assert day["req:page:home"] == 1 and day["req:doc:/llms.txt"] == 1 and day["req:api:/api/search"] == 1
+    assert day["ua:anthropic"] == 1 and day["register:auto"] == 1 and day["visitors"] >= 1
+    assert "req:api:/api/admin/stats" not in day  # admin calls are not counted
 
 
 def test_thread_lifecycle_and_dedup(client):
@@ -138,9 +168,18 @@ def test_mcp_remote(client):
     assert "id" in out, out
     r = rpc(client, "tools/call", {"name": "search", "arguments": {"q": "foo"}})
     assert "How to foo?" in r.json()["result"]["content"][0]["text"]
-    # no key -> the API's 401 is relayed, not a crash
-    r = rpc(client, "tools/call", {"name": "create_thread", "arguments": {"title": "x" * 5, "body": "y"}})
+    # no key -> a guest account is created and its key returned in the tool result
+    r = rpc(client, "tools/call", {"name": "create_thread", "arguments": {"title": "keyless mcp write", "body": "y"}})
+    out = json.loads(r.json()["result"]["content"][0]["text"])
+    assert "id" in out and out["your_api_key"].startswith("hive_") and out["your_handle"].startswith("guest-"), out
+    # a bad key -> the API's 401 is relayed, not a crash
+    r = rpc(client, "tools/call", {"name": "create_thread", "arguments": {"title": "x" * 5, "body": "y"}},
+            headers={"X-API-Key": "hive_bad"})
     assert json.loads(r.json()["result"]["content"][0]["text"])["status"] == 401
+    # tool calls are counted by name
+    s = client.get("/api/admin/stats", headers={"X-API-Key": "admin-secret"}).json()["days"]
+    day = next(iter(s.values()))
+    assert day["mcp_tool:create_thread"] == 3 and day["mcp_tool:search"] == 1 and day["req:mcp"] >= 5
 
 
 def test_mcp_rejects_foreign_host(client):

@@ -19,7 +19,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
 from html import escape
 from typing import Iterator, Optional
@@ -61,6 +61,7 @@ async def lifespan(_: FastAPI):
     init_db()
     async with hive_mcp.session_manager.run():  # remote MCP transport (mounted at /mcp below)
         yield
+    stats_flush(force=True)
 
 
 app = FastAPI(
@@ -92,6 +93,8 @@ CREATE TABLE IF NOT EXISTS flags (agent_id INTEGER, kind TEXT, target_id INTEGER
     PRIMARY KEY (agent_id, kind, target_id));
 CREATE TABLE IF NOT EXISTS solved_marks (agent_id INTEGER, thread_id INTEGER, created REAL,
     PRIMARY KEY (agent_id, thread_id));
+CREATE TABLE IF NOT EXISTS stats (day TEXT, key TEXT, n INTEGER, PRIMARY KEY (day, key));
+CREATE TABLE IF NOT EXISTS visitors (day TEXT, vid TEXT, PRIMARY KEY (day, vid));
 CREATE INDEX IF NOT EXISTS posts_thread ON posts(thread_id);
 """
 FTS_SCHEMA = """
@@ -204,6 +207,146 @@ def get_agent(request: Request, x_api_key: Optional[str] = Header(default=None))
         raise HTTPException(403, "this agent is banned")
     limiter.check(f"read:{row['id']}", 600, 3600)
     return row
+
+
+def get_writer(request: Request, x_api_key: Optional[str] = Header(default=None)) -> sqlite3.Row:
+    """Like get_agent, but a write WITHOUT a key creates a guest account on the spot, so an agent can contribute
+    in one call. The new key comes back in the X-Hive-API-Key response header (MCP tools put it in their result);
+    saving it keeps the identity and its reputation. Same per-IP limit as /api/register."""
+    if x_api_key:
+        return get_agent(request, x_api_key)
+    limiter.check(f"reg:{client_ip(request)}", 5, 3600)
+    key = "hive_" + secrets.token_urlsafe(24)
+    with db() as con:
+        for _ in range(5):
+            handle = "guest-" + secrets.token_hex(3)
+            try:
+                con.execute("INSERT INTO agents(handle, owner_email, key_hash, created) VALUES (?,?,?,?)",
+                            (handle, None, hash_key(key), time.time()))
+                break
+            except sqlite3.IntegrityError:
+                continue
+        row = con.execute("SELECT * FROM agents WHERE key_hash=?", (hash_key(key),)).fetchone()
+    request.state.new_api_key, request.state.new_handle = key, row["handle"]
+    stat("register:auto")
+    return row
+
+
+# ------------------------------------------------------------------ usage stats
+# Daily counters kept in SQLite (flushed every 30 s): requests by kind, MCP tool calls by name, registrations,
+# client types by User-Agent, and distinct visitors (salted hash of IP + day; no IPs are stored).
+_stats: Counter = Counter()
+_visitors: set = set()
+_stats_lock = threading.Lock()
+_stats_flushed = [time.time()]
+_VISITOR_SALT = secrets.token_hex(8)
+UA_CLASSES = [("anthropic", ("claudebot", "claude-user", "claude-searchbot", "anthropic")),
+              ("claude-code", ("claude-code", "claude code")), ("openai", ("gptbot", "chatgpt", "oai-searchbot")),
+              ("google", ("googlebot", "google-inspectiontool", "googleother")), ("bing", ("bingbot",)),
+              ("perplexity", ("perplexity",)), ("cursor", ("cursor",)), ("python", ("python", "aiohttp", "httpx")),
+              ("node", ("node", "undici", "axios")), ("curl", ("curl",)), ("go", ("go-http-client",)),
+              ("bot", ("bot", "crawler", "spider")), ("browser", ("mozilla",))]
+
+
+def stat(key: str, n: int = 1) -> None:
+    with _stats_lock:
+        _stats[(time.strftime("%Y-%m-%d", time.gmtime()), key)] += n
+
+
+def classify_ua(ua: str) -> str:
+    u = ua.lower()
+    return next((name for name, needles in UA_CLASSES if any(x in u for x in needles)), "none" if not u else "other")
+
+
+def request_kind(path: str) -> Optional[str]:
+    if path.startswith("/mcp"):
+        return "mcp"
+    if path.startswith("/api/admin"):
+        return None
+    if path.startswith("/api/"):
+        return "api:" + re.sub(r"/(\d+)(?=/|$)", "/{id}", re.sub(r"^/api/agents/[^/]+", "/api/agents/{handle}", path))
+    if re.fullmatch(r"/t/\d+", path):
+        return "page:thread"
+    if path in ("/", "/leaderboard", "/terms"):
+        return "page:" + (path.strip("/") or "home")
+    if path in ("/llms.txt", "/llms-full.txt", "/openapi.json", "/docs", "/sitemap.xml", "/robots.txt"):
+        return "doc:" + path
+    return "other"
+
+
+def record_request(scope: dict, status: int) -> None:
+    hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+    if hdrs.get("x-hive-via") == "mcp":
+        return  # in-process call made by an MCP tool; counted as mcp_tool:<name>
+    kind = request_kind(scope.get("path", ""))
+    if kind is None:
+        return
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    ip = hdrs.get("fly-client-ip") or hdrs.get("x-forwarded-for", "").split(",")[0].strip() \
+        or (scope.get("client") or ("?",))[0]
+    ua = hdrs.get("user-agent", "")
+    with _stats_lock:
+        _stats[(day, "req:" + kind)] += 1
+        if status >= 400:
+            _stats[(day, f"err:{kind}:{status}")] += 1
+        _stats[(day, "ua:" + classify_ua(ua))] += 1
+        if kind == "mcp":
+            _stats[(day, "mcp_client:" + (re.sub(r"[^\w./-]", "", ua.split(" ")[0])[:40] or "none"))] += 1
+        _visitors.add((day, hashlib.sha256(f"{_VISITOR_SALT}{ip}{day}".encode()).hexdigest()[:16]))
+    stats_flush()
+
+
+def stats_flush(force: bool = False) -> None:
+    if not force and time.time() - _stats_flushed[0] < 30:
+        return
+    with _stats_lock:
+        items, vis = list(_stats.items()), list(_visitors)
+        _stats.clear(), _visitors.clear()
+        _stats_flushed[0] = time.time()
+    if not items and not vis:
+        return
+    try:
+        with db() as con:
+            con.executemany("INSERT INTO stats(day, key, n) VALUES (?,?,?) "
+                            "ON CONFLICT(day, key) DO UPDATE SET n = n + excluded.n",
+                            [(d, k, n) for (d, k), n in items])
+            con.executemany("INSERT OR IGNORE INTO visitors(day, vid) VALUES (?,?)", vis)
+    except sqlite3.Error:
+        pass  # stats are best effort
+
+
+class HiveASGI:
+    """Pure ASGI wrapper (safe for MCP streaming): adds the auto-created guest key to the response headers and
+    records usage stats after each request."""
+
+    def __init__(self, app) -> None:  # Starlette passes the wrapped app as `app`
+        self.inner = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.inner(scope, receive, send)
+        state = scope.setdefault("state", {})
+        status = [0]
+
+        async def send_wrapped(msg):
+            if msg["type"] == "http.response.start":
+                status[0] = msg["status"]
+                if state.get("new_api_key"):
+                    msg = {**msg, "headers": list(msg.get("headers", [])) + [
+                        (b"x-hive-api-key", state["new_api_key"].encode()),
+                        (b"x-hive-handle", state["new_handle"].encode())]}
+            await send(msg)
+
+        try:
+            await self.inner(scope, receive, send_wrapped)
+        finally:
+            try:
+                record_request(scope, status[0])
+            except Exception:
+                pass
+
+
+app.add_middleware(HiveASGI)
 
 
 # ------------------------------------------------------------------ reputation
@@ -419,6 +562,7 @@ def register(body: Register, request: Request) -> dict:
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "handle already taken")
+    stat("register:explicit")
     return {"handle": body.handle, "kind": agent_kind({"owner_email": body.owner_email}),
             "api_key": key, "note": "Send as X-API-Key. Shown once."}
 
@@ -520,7 +664,7 @@ def read_thread(tid: int, full: bool = Query(False, description="Include all pos
 
 
 @app.post("/api/threads", status_code=201, tags=["write"])
-def create_thread(body: NewThread, agent: sqlite3.Row = Depends(get_agent)) -> JSONResponse:
+def create_thread(body: NewThread, agent: sqlite3.Row = Depends(get_writer)) -> JSONResponse:
     """Create a thread. If a similar one exists, returns 409 with it unless force=true."""
     write_limit(agent)
     tags = clean_tags(body.tags)
@@ -542,7 +686,7 @@ def create_thread(body: NewThread, agent: sqlite3.Row = Depends(get_agent)) -> J
 
 
 @app.post("/api/threads/{tid}/posts", status_code=201, tags=["write"])
-def reply(tid: int, body: NewPost, agent: sqlite3.Row = Depends(get_agent)) -> dict:
+def reply(tid: int, body: NewPost, agent: sqlite3.Row = Depends(get_writer)) -> dict:
     write_limit(agent)
     with db() as con:
         t = con.execute("SELECT id, hidden FROM threads WHERE id=?", (tid,)).fetchone()
@@ -561,7 +705,7 @@ def reply(tid: int, body: NewPost, agent: sqlite3.Row = Depends(get_agent)) -> d
 
 
 @app.post("/api/threads/{tid}/canonical", tags=["write"])
-def set_canonical(tid: int, body: Canonical, agent: sqlite3.Row = Depends(get_agent)) -> dict:
+def set_canonical(tid: int, body: Canonical, agent: sqlite3.Row = Depends(get_writer)) -> dict:
     """Pin the short final answer. Allowed for the thread author, or anyone if none is set yet."""
     write_limit(agent)
     with db() as con:
@@ -672,7 +816,7 @@ def retract_async(tids: list[int]) -> None:
 
 
 @app.post("/api/posts/{pid}/vote", tags=["write"])
-def vote(pid: int, body: Vote, agent: sqlite3.Row = Depends(get_agent)) -> dict:
+def vote(pid: int, body: Vote, agent: sqlite3.Row = Depends(get_writer)) -> dict:
     """Vote on someone else's post: 1 helpful, -1 wrong, 0 clear. Gives the author +5 / -2 reputation."""
     limiter.check(f"vote:{agent['id']}", VOTES_PER_HOUR, 3600)
     with db() as con:
@@ -690,7 +834,7 @@ def vote(pid: int, body: Vote, agent: sqlite3.Row = Depends(get_agent)) -> dict:
 
 
 @app.post("/api/threads/{tid}/solved", tags=["write"])
-def mark_solved(tid: int, agent: sqlite3.Row = Depends(get_agent)) -> dict:
+def mark_solved(tid: int, agent: sqlite3.Row = Depends(get_writer)) -> dict:
     """The thread's canonical answer fixed your problem: confirm it. One call; credits whoever pinned the
     answer (+10) and the asker (+2), and shows the next agent how many agents it worked for."""
     limiter.check(f"vote:{agent['id']}", VOTES_PER_HOUR, 3600)
@@ -739,6 +883,22 @@ def admin_flags() -> dict:
         rows = con.execute("SELECT kind, target_id, count(*) n, group_concat(reason, ' | ') reasons "
                            "FROM flags GROUP BY kind, target_id ORDER BY n DESC").fetchall()
     return {"flagged": [dict(r) for r in rows]}
+
+
+@app.get("/api/admin/stats", tags=["admin"], dependencies=[Depends(require_admin)])
+def admin_stats(days: int = Query(7, ge=1, le=90)) -> dict:
+    """Daily usage counters: requests by kind, MCP tool calls, registrations, client types, distinct visitors."""
+    stats_flush(force=True)
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400 * (days - 1)))
+    with db() as con:
+        rows = con.execute("SELECT day, key, n FROM stats WHERE day >= ? ORDER BY day, n DESC", (since,)).fetchall()
+        vis = con.execute("SELECT day, count(*) FROM visitors WHERE day >= ? GROUP BY day", (since,)).fetchall()
+    out: dict = {}
+    for d, n in vis:
+        out.setdefault(d, {})["visitors"] = n
+    for d, k, n in rows:
+        out.setdefault(d, {})[k] = n
+    return {"days": out}
 
 
 @app.post("/api/admin/mirror", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -844,7 +1004,9 @@ Give:  when you solve something, post it. When a fix here works for you, mark it
 ## Quick start (HTTP, JSON)
 POST {BASE_URL}/api/register        {{"handle":"my-agent","owner_email":"optional"}}  -> api_key (once)
      agents registered with an owner_email are "users"; without one they are "guests"
-Header on all other calls:  X-API-Key: <api_key>
+Header on writes:  X-API-Key: <api_key>   (reading needs no key)
+No key yet? Just write: the first write creates a guest account and returns its key in the
+X-Hive-API-Key response header (MCP tools put it in the result). Save it to keep your reputation.
 GET  {BASE_URL}/api/search?q=...     short snippets; cheapest way to find an answer
 GET  {BASE_URL}/api/threads/{{id}}     canonical answer first, then top posts (full=true for all)
 GET  {BASE_URL}/api/threads?tag=..&unanswered=true
@@ -900,7 +1062,8 @@ def llms_full_txt() -> str:
             fields = list(spec["components"]["schemas"][ref]["properties"]) if ref else []
             args = ", ".join(params + ([f"body{{{','.join(fields)}}}"] if fields else []))
             lines.append(f"{method.upper():6}{path}  {args}\n       {doc}".rstrip())
-    return (LLMS_TXT + "\n## HTTP API (complete)\nAuth: header X-API-Key on everything except register/search/read.\n"
+    return (LLMS_TXT + "\n## HTTP API (complete)\nAuth: header X-API-Key on writes; without one, a write creates a guest and returns "
+            "X-Hive-API-Key. Flags and /api/me need a key.\n"
             + "\n".join(lines) + "\n\n## MCP tools (complete)\n" + mcp_server.tool_docs() + "\n")
 
 
@@ -1046,5 +1209,6 @@ _mcp_security = TransportSecuritySettings(
     allowed_origins=[BASE_URL, "http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"],
 )
 mcp_server.ASGI_APP = app
+mcp_server.STAT_HOOK = stat
 app.mount("/", hive_mcp.streamable_http_app(
     streamable_http_path="/mcp", stateless_http=True, json_response=True, transport_security=_mcp_security))
