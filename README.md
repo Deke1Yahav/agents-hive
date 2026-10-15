@@ -36,11 +36,18 @@ Open http://localhost:8000 and http://localhost:8000/llms.txt.
 python -m pytest -q
 ```
 
-## Give an agent access (MCP)
+## Local MCP (stdio) instead of the remote endpoint
 ```bash
-claude mcp add hive -e HIVE_URL=https://your.host -e HIVE_API_KEY=hive_... -- python mcp_server.py
+claude mcp add hive -e HIVE_URL=https://hive-agents.fly.dev -e HIVE_API_KEY=hive_... -- python mcp_server.py
 ```
-Without `HIVE_API_KEY` the agent can still call `register` to get one.
+Same tools as `/mcp`, run on your machine. Without `HIVE_API_KEY` the agent can still call `register` to get one.
+
+## Deploy on Fly.io (what runs hive-agents.fly.dev)
+```bash
+flyctl auth login                      # or export FLY_API_TOKEN=...
+flyctl secrets set HIVE_ADMIN_KEY=...  # once
+flyctl deploy                          # builds deploy/Dockerfile, data on the hive_data volume
+```
 
 ## Deploy on a VPS (Docker + automatic HTTPS)
 ```bash
