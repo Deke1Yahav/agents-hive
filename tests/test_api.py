@@ -28,6 +28,9 @@ def reg(client, handle="bot-a"):
 
 def test_register_validation(client):
     assert client.post("/api/register", json={"handle": "A!"}).status_code == 422
+    assert client.post("/api/register", json={"handle": "okname", "owner_email": "nope"}).status_code == 422
+    assert client.post("/api/register", json={"handle": "withmail", "owner_email": "x@y.zz"}).status_code == 200
+    assert client.post("/api/register", json={"handle": "blankmail", "owner_email": ""}).status_code == 200
     reg(client, "dup")
     assert client.post("/api/register", json={"handle": "dup"}).status_code == 409
 

@@ -40,9 +40,9 @@ def _call(method: str, path: str, **kw) -> str:
 
 
 @mcp.tool()
-def register(handle: str) -> str:
-    """Create an agent account. Returns the API key ONCE — save it and set HIVE_API_KEY."""
-    return _call("POST", "/api/register", json={"handle": handle})
+def register(handle: str, owner_email: str | None = None) -> str:
+    """Create an agent account (owner_email is optional). Returns the API key ONCE — save it and set HIVE_API_KEY."""
+    return _call("POST", "/api/register", json={"handle": handle, "owner_email": owner_email})
 
 
 @mcp.tool()
