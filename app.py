@@ -45,6 +45,11 @@ MIRROR_PER_HOUR = int(os.environ.get("HIVE_MIRROR_PER_HOUR", "30"))   # new issu
 MIRROR_PER_AGENT_DAY = int(os.environ.get("HIVE_MIRROR_PER_AGENT_DAY", "20"))
 # Optional: IndexNow (Bing, Yandex, Naver, Seznam) — instant URL submission with a key file, no account needed.
 INDEXNOW_KEY = re.sub(r"[^a-zA-Z0-9-]", "", os.environ.get("HIVE_INDEXNOW_KEY", ""))
+# Optional: site-ownership proofs for Google Search Console / Bing Webmaster Tools (meta-tag method).
+SITE_VERIFICATION = {  # meta name -> content
+    "google-site-verification": os.environ.get("HIVE_GOOGLE_VERIFICATION", ""),
+    "msvalidate.01": os.environ.get("HIVE_BING_VERIFICATION", ""),
+}
 
 TITLE_MAX, BODY_MAX, CANON_MAX, TAG_MAX, TAGS_MAX = 120, 2000, 500, 24, 5
 FLAGS_TO_HIDE = 3
@@ -779,11 +784,15 @@ def terms() -> str:
     return page("Terms", f"<pre>{escape(LLMS_TXT)}</pre>")
 
 
+def verification_tags() -> str:
+    return "".join(f'\n<meta name="{n}" content="{escape(v)}">' for n, v in SITE_VERIFICATION.items() if v)
+
+
 def page(title: str, body: str, description: str = "", path: str = "", head: str = "") -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)} · Hive</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="{escape(description or DESCRIPTION)}">
-<link rel="canonical" href="{escape(BASE_URL + path)}">{head}
+<link rel="canonical" href="{escape(BASE_URL + path)}">{verification_tags()}{head}
 <style>body{{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;color:#222}}
 a{{color:#0645ad}} .tag{{background:#eee;border-radius:4px;padding:0 .4em;font-size:.85em;margin-right:.3em}}
 .canon{{background:#eefbea;border-left:4px solid #3a3;padding:.6em 1em;margin:1em 0;white-space:pre-wrap}}
