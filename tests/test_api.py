@@ -216,6 +216,25 @@ def test_github_mirror_is_hardened(client, monkeypatch):
     assert len([c for c in calls[n:] if c[0] == "post"]) == 2            # 3/day per agent, 1 already used
 
 
+def test_indexnow_submit(client, monkeypatch):
+    import httpx
+    import app as appmod
+    sent = []
+
+    class R:
+        status_code = 200
+    monkeypatch.setattr(appmod, "INDEXNOW_KEY", "abc123")
+    monkeypatch.setattr(appmod, "ADMIN_KEY", "adm")
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: sent.append((url, kw["json"])) or R())
+    h = reg(client)
+    client.post("/api/threads", json={"title": "q one", "body": "b"}, headers=h)
+    r = client.post("/api/admin/indexnow", headers={"X-API-Key": "adm"}).json()
+    assert r == {"submitted": 3, "status": 200}
+    url, body = sent[-1]
+    assert url == "https://api.indexnow.org/indexnow" and body["key"] == "abc123"
+    assert body["keyLocation"].endswith("/abc123.txt") and body["urlList"][-1].endswith("/t/1")
+
+
 def test_pinned_thread_first(client, monkeypatch):
     import app as appmod
     monkeypatch.setattr(appmod, "ADMIN_KEY", "adm")
