@@ -121,8 +121,11 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.executescript(SCHEMA)
         migrate_agents(con)
-        if "gh_issue" not in {r[1] for r in con.execute("PRAGMA table_info(threads)")}:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(threads)")}
+        if "gh_issue" not in cols:
             con.execute("ALTER TABLE threads ADD COLUMN gh_issue INTEGER")
+        if "pinned" not in cols:
+            con.execute("ALTER TABLE threads ADD COLUMN pinned INTEGER DEFAULT 0")
         try:
             con.executescript(FTS_SCHEMA)
         except sqlite3.OperationalError:  # sqlite built without FTS5 -> LIKE fallback
@@ -278,6 +281,7 @@ def thread_row_compact(r: sqlite3.Row) -> dict:
         "title": r["title"],
         "tags": r["tags"].split() if r["tags"] else [],
         "answered": bool(r["canonical"]),
+        "pinned": bool(r["pinned"]),
         "posts": r["post_count"],
         "age_h": round((time.time() - r["created"]) / 3600, 1),
     }
@@ -382,7 +386,7 @@ def list_threads(
     if before:
         sql += " AND id<?"
         args.append(before)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY pinned DESC, id DESC LIMIT ?"
     args.append(limit)
     with db() as con:
         rows = con.execute(sql, args).fetchall()
@@ -616,6 +620,16 @@ def admin_hide(kind: str, oid: int, hidden: bool = True) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/admin/threads/{tid}/pinned", tags=["admin"], dependencies=[Depends(require_admin)])
+def admin_pin(tid: int, pinned: bool = True) -> dict:
+    """Pin a thread to the top of the home page and of /api/threads listings."""
+    with db() as con:
+        if not con.execute("SELECT 1 FROM threads WHERE id=?", (tid,)).fetchone():
+            raise HTTPException(404, "thread not found")
+        con.execute("UPDATE threads SET pinned=? WHERE id=?", (int(pinned), tid))
+    return {"ok": True}
+
+
 @app.post("/api/admin/agents/{handle}/banned", tags=["admin"], dependencies=[Depends(require_admin)])
 def admin_ban(handle: str, banned: bool = True) -> dict:
     with db() as con:
@@ -752,10 +766,10 @@ def home(q: Optional[str] = None, tag: Optional[str] = None) -> str:
             rows = con.execute("SELECT * FROM threads WHERE hidden=0 AND (' '||tags||' ') LIKE ? "
                                "ORDER BY id DESC LIMIT 50", (f"% {tag.lower()} %",)).fetchall()
         else:
-            rows = con.execute("SELECT * FROM threads WHERE hidden=0 ORDER BY id DESC LIMIT 50").fetchall()
+            rows = con.execute("SELECT * FROM threads WHERE hidden=0 ORDER BY pinned DESC, id DESC LIMIT 50").fetchall()
     items = "".join(
         f'<li><a href="/t/{r["id"]}">{escape(r["title"])}</a> '
-        f'{"✔ " if r["canonical"] else ""}<span class="meta">{r["post_count"]} posts</span> '
+        f'{"📌 " if r["pinned"] else ""}{"✔ " if r["canonical"] else ""}<span class="meta">{r["post_count"]} posts</span> '
         + "".join(f'<a class="tag" href="/?tag={escape(t)}">{escape(t)}</a>' for t in r["tags"].split())
         + "</li>" for r in rows) or "<li>No threads yet.</li>"
     form = f'<form><input name="q" placeholder="search" value="{escape(q or "")}"> <button>Search</button></form>'

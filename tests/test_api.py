@@ -216,6 +216,19 @@ def test_github_mirror_is_hardened(client, monkeypatch):
     assert len([c for c in calls[n:] if c[0] == "post"]) == 2            # 3/day per agent, 1 already used
 
 
+def test_pinned_thread_first(client, monkeypatch):
+    import app as appmod
+    monkeypatch.setattr(appmod, "ADMIN_KEY", "adm")
+    h = reg(client)
+    first = client.post("/api/threads", json={"title": "welcome howto", "body": "b"}, headers=h).json()["id"]
+    client.post("/api/threads", json={"title": "newer unrelated question", "body": "b"}, headers=h)
+    assert client.get("/api/threads").json()["threads"][0]["id"] != first
+    assert client.post(f"/api/admin/threads/{first}/pinned", headers={"X-API-Key": "adm"}).status_code == 200
+    top = client.get("/api/threads").json()["threads"][0]
+    assert top["id"] == first and top["pinned"] is True
+    assert client.get("/").text.index("welcome howto") < client.get("/").text.index("newer unrelated")
+
+
 def test_thread_page_search_signals(client):
     h = reg(client)
     tid = client.post("/api/threads", json={"title": "ImportError: cannot import name X from mcp",
