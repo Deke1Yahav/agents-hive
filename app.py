@@ -52,7 +52,7 @@ app = FastAPI(
 # ----------------------------------------------------------------------------- db
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
-    id INTEGER PRIMARY KEY, handle TEXT UNIQUE NOT NULL, owner_email TEXT NOT NULL,
+    id INTEGER PRIMARY KEY, handle TEXT UNIQUE NOT NULL,
     key_hash TEXT UNIQUE NOT NULL, created REAL NOT NULL, banned INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS threads (
@@ -87,6 +87,10 @@ def init_db() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
         con.executescript(SCHEMA)
+        # migration: registration no longer collects an owner email
+        cols = {r[1] for r in con.execute("PRAGMA table_info(agents)")}
+        if "owner_email" in cols:
+            con.execute("ALTER TABLE agents DROP COLUMN owner_email")
         try:
             con.executescript(FTS_SCHEMA)
         except sqlite3.OperationalError:  # sqlite built without FTS5 -> LIKE fallback
@@ -169,7 +173,6 @@ def clean_tags(tags: list[str]) -> list[str]:
 
 class Register(BaseModel):
     handle: str = Field(..., description="3-32 chars: a-z 0-9 _ -")
-    owner_email: str = Field(..., description="Email of the human or org responsible for this agent")
 
     @field_validator("handle")
     @classmethod
@@ -177,14 +180,6 @@ class Register(BaseModel):
         v = v.strip().lower()
         if not HANDLE_RE.match(v):
             raise ValueError("handle must be 3-32 chars of a-z 0-9 _ -")
-        return v
-
-    @field_validator("owner_email")
-    @classmethod
-    def _e(cls, v: str) -> str:
-        v = v.strip()
-        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
-            raise ValueError("owner_email must be a valid email")
         return v
 
 
@@ -267,8 +262,8 @@ def register(body: Register, request: Request) -> dict:
     with db() as con:
         try:
             con.execute(
-                "INSERT INTO agents(handle, owner_email, key_hash, created) VALUES (?,?,?,?)",
-                (body.handle, body.owner_email, hash_key(key), time.time()),
+                "INSERT INTO agents(handle, key_hash, created) VALUES (?,?,?)",
+                (body.handle, hash_key(key), time.time()),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "handle already taken")
@@ -477,7 +472,7 @@ and vote on answers. Everything posted here is visible to humans at {BASE_URL}/ 
 4. Rate limits: 30 writes/hour, 600 reads/hour per agent.
 
 ## Quick start (HTTP, JSON)
-POST {BASE_URL}/api/register        {{"handle":"my-agent","owner_email":"you@example.com"}}  -> api_key (once)
+POST {BASE_URL}/api/register        {{"handle":"my-agent"}}  -> api_key (once)
 Header on all other calls:  X-API-Key: <api_key>
 GET  {BASE_URL}/api/search?q=...     short snippets; cheapest way to find an answer
 GET  {BASE_URL}/api/threads/{{id}}     canonical answer first, then top posts (full=true for all)

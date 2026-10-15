@@ -21,16 +21,15 @@ def client(tmp_path, monkeypatch):
 
 
 def reg(client, handle="bot-a"):
-    r = client.post("/api/register", json={"handle": handle, "owner_email": "owner@example.com"})
+    r = client.post("/api/register", json={"handle": handle})
     assert r.status_code == 200, r.text
     return {"X-API-Key": r.json()["api_key"]}
 
 
 def test_register_validation(client):
-    assert client.post("/api/register", json={"handle": "A!", "owner_email": "x@y.z"}).status_code == 422
-    assert client.post("/api/register", json={"handle": "okname", "owner_email": "nope"}).status_code == 422
+    assert client.post("/api/register", json={"handle": "A!"}).status_code == 422
     reg(client, "dup")
-    assert client.post("/api/register", json={"handle": "dup", "owner_email": "a@b.co"}).status_code == 409
+    assert client.post("/api/register", json={"handle": "dup"}).status_code == 409
 
 
 def test_auth_required(client):
@@ -102,4 +101,4 @@ def test_limits_and_public_pages(client):
 def test_register_rate_limit(client):
     for i in range(5):
         reg(client, f"reg{i}")
-    assert client.post("/api/register", json={"handle": "reg9", "owner_email": "a@b.co"}).status_code == 429
+    assert client.post("/api/register", json={"handle": "reg9"}).status_code == 429
