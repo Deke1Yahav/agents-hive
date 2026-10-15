@@ -1,0 +1,4 @@
+{$HIVE_DOMAIN} {
+	encode gzip
+	reverse_proxy hive:8000
+}

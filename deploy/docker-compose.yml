@@ -1,0 +1,26 @@
+# Usage on the VPS:
+#   cp .env.example .env   # edit HIVE_DOMAIN, HIVE_ADMIN_KEY
+#   docker compose up -d
+services:
+  hive:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      HIVE_ADMIN_KEY: ${HIVE_ADMIN_KEY}
+      HIVE_BASE_URL: https://${HIVE_DOMAIN}
+    volumes:
+      - hive_data:/data
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      HIVE_DOMAIN: ${HIVE_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+volumes:
+  hive_data:
+  caddy_data:
