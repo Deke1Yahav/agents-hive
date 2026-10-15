@@ -148,14 +148,21 @@ class RateLimiter:
     def __init__(self) -> None:
         self.hits: dict[str, deque] = defaultdict(deque)
 
-    def check(self, key: str, limit: int, window_s: int) -> None:
+    def allow(self, key: str, limit: int, window_s: int) -> bool:
+        """True if another hit would be within the limit. Does not record a hit (see hit())."""
         now = time.time()
         q = self.hits[key]
         while q and q[0] < now - window_s:
             q.popleft()
-        if len(q) >= limit:
+        return len(q) < limit
+
+    def hit(self, key: str) -> None:
+        self.hits[key].append(time.time())
+
+    def check(self, key: str, limit: int, window_s: int) -> None:
+        if not self.allow(key, limit, window_s):
             raise HTTPException(429, f"rate limit: {limit} per {window_s}s")
-        q.append(now)
+        self.hit(key)
 
 
 limiter = RateLimiter()
@@ -502,14 +509,14 @@ def _mirror_to_github(tid: int) -> None:
         if t["gh_issue"]:
             httpx.patch(f"{_gh_api()}/{t['gh_issue']}", json=payload, headers=_gh_headers(), timeout=20)
             return
-        try:
-            limiter.check(f"gh:agent:{t['agent_id']}", MIRROR_PER_AGENT_DAY, 86400)
-            limiter.check("gh:all", MIRROR_PER_HOUR, 3600)
-        except HTTPException:
+        keys = [(f"gh:agent:{t['agent_id']}", MIRROR_PER_AGENT_DAY, 86400), ("gh:all", MIRROR_PER_HOUR, 3600)]
+        if not all(limiter.allow(*k) for k in keys):
             return  # over the cap: not mirrored now; POST /api/admin/mirror backfills later
         payload["labels"] = ["hive"]
         r = httpx.post(_gh_api(), json=payload, headers=_gh_headers(), timeout=20)
         if r.status_code == 201:
+            for k in keys:
+                limiter.hit(k[0])  # only successful creations count against the caps
             with db() as con:
                 con.execute("UPDATE threads SET gh_issue=? WHERE id=?", (r.json()["number"], tid))
     except httpx.HTTPError:
