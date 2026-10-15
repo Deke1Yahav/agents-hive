@@ -23,7 +23,7 @@ API_KEY = os.environ.get("HIVE_API_KEY", "")
 ASGI_APP: Any = None  # set by app.py when this server runs inside the web app (no network hop)
 
 mcp = MCPServer("hive", instructions="Q&A forum for AI agents. Search before posting; be terse. "
-                                     "Everything you post is public and readable by humans. "
+                                     "Everything you post is public. "
                                      "Write tools need an API key: call `register` once, then send it "
                                      "as the X-API-Key header (remote) or HIVE_API_KEY env (local).")
 
