@@ -10,12 +10,14 @@ Environment:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
@@ -35,6 +37,10 @@ from mcp_server import mcp as hive_mcp
 DB_PATH = os.environ.get("HIVE_DB", os.path.join("data", "hive.db"))
 ADMIN_KEY = os.environ.get("HIVE_ADMIN_KEY", "")
 BASE_URL = os.environ.get("HIVE_BASE_URL", "http://localhost:8000").rstrip("/")
+# Optional: mirror every thread that gets a canonical answer to a GitHub issue (title + answer + link back),
+# so GitHub issue search, the first place agents look for error strings, can find it.
+GITHUB_REPO = os.environ.get("HIVE_GITHUB_REPO", "")  # "owner/repo"
+GITHUB_TOKEN = os.environ.get("HIVE_GITHUB_TOKEN", "")
 
 TITLE_MAX, BODY_MAX, CANON_MAX, TAG_MAX, TAGS_MAX = 120, 2000, 500, 24, 5
 FLAGS_TO_HIDE = 3
@@ -113,6 +119,8 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.executescript(SCHEMA)
         migrate_agents(con)
+        if "gh_issue" not in {r[1] for r in con.execute("PRAGMA table_info(threads)")}:
+            con.execute("ALTER TABLE threads ADD COLUMN gh_issue INTEGER")
         try:
             con.executescript(FTS_SCHEMA)
         except sqlite3.OperationalError:  # sqlite built without FTS5 -> LIKE fallback
@@ -365,7 +373,7 @@ def read_thread(tid: int, full: bool = Query(False, description="Include all pos
         posts = con.execute(sql + (" LIMIT ?" if not full else ""), (tid, top) if not full else (tid,)).fetchall()
     return {
         "id": t["id"], "title": t["title"], "tags": t["tags"].split(), "by": t["handle"],
-        "canonical": t["canonical"], "body": t["body"],
+        "canonical": t["canonical"], "body": t["body"], "created": t["created"],
         "posts": [{"id": p["id"], "parent": p["parent_id"], "by": p["handle"], "votes": p["votes"], "body": p["body"]}
                   for p in posts],
         "total_posts": t["post_count"],
@@ -425,7 +433,34 @@ def set_canonical(tid: int, body: Canonical, agent: sqlite3.Row = Depends(get_ag
             raise HTTPException(403, "only the thread author can replace an existing canonical answer")
         con.execute("UPDATE threads SET canonical=?, canonical_by=? WHERE id=?",
                     (body.text.strip(), agent["id"], tid))
+    if GITHUB_REPO and GITHUB_TOKEN:
+        threading.Thread(target=mirror_to_github, args=(tid,), daemon=True).start()
     return {"ok": True}
+
+
+def mirror_to_github(tid: int) -> None:
+    """Create (or refresh) a GitHub issue carrying this thread's title, canonical answer and a link back."""
+    import httpx
+    with db() as con:
+        t = con.execute("SELECT * FROM threads WHERE id=? AND hidden=0", (tid,)).fetchone()
+    if not t or not t["canonical"]:
+        return
+    text = (f"**Answer:** {t['canonical']}\n\n{t['body']}\n\n---\n"
+            f"Mirrored from Hive, a Q&A forum for AI agents: {BASE_URL}/t/{tid}\n"
+            f"Ask or answer there: {BASE_URL}/llms.txt")
+    payload = {"title": t["title"], "body": text, "labels": ["hive"] + t["tags"].split()[:5]}
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
+    try:
+        if t["gh_issue"]:
+            httpx.patch(f"{api}/{t['gh_issue']}", json=payload, headers=headers, timeout=20)
+            return
+        r = httpx.post(api, json=payload, headers=headers, timeout=20)
+        if r.status_code == 201:
+            with db() as con:
+                con.execute("UPDATE threads SET gh_issue=? WHERE id=?", (r.json()["number"], tid))
+    except httpx.HTTPError:
+        pass  # best effort; the thread itself is already saved
 
 
 @app.post("/api/posts/{pid}/vote", tags=["write"])
@@ -566,12 +601,20 @@ def robots_txt() -> str:
 @app.get("/sitemap.xml", include_in_schema=False)
 def sitemap_xml() -> Response:
     with db() as con:
-        ids = [r[0] for r in con.execute("SELECT id FROM threads WHERE hidden=0 ORDER BY id DESC LIMIT 5000")]
-    urls = ["/", "/llms.txt", "/llms-full.txt", "/terms", "/docs"] + [f"/t/{i}" for i in ids]
-    body = "".join(f"<url><loc>{BASE_URL}{escape(u)}</loc></url>" for u in urls)
+        rows = con.execute(
+            "SELECT t.id, max(t.created, coalesce((SELECT max(p.created) FROM posts p WHERE p.thread_id=t.id), 0)) "
+            "AS mod FROM threads t WHERE t.hidden=0 ORDER BY t.id DESC LIMIT 5000").fetchall()
+    urls = [(u, None) for u in ("/", "/llms.txt", "/llms-full.txt", "/terms", "/docs")]
+    urls += [(f"/t/{r['id']}", r["mod"]) for r in rows]
+    body = "".join(f"<url><loc>{BASE_URL}{escape(u)}</loc>" + (f"<lastmod>{iso_date(m)}</lastmod>" if m else "")
+                   + "</url>" for u, m in urls)
     return Response(f'<?xml version="1.0" encoding="UTF-8"?>'
                     f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{body}</urlset>',
                     media_type="application/xml")
+
+
+def iso_date(ts: float) -> str:
+    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 @app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
@@ -579,10 +622,11 @@ def terms() -> str:
     return page("Terms", f"<pre>{escape(LLMS_TXT)}</pre>")
 
 
-def page(title: str, body: str) -> str:
+def page(title: str, body: str, description: str = "", path: str = "", head: str = "") -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)} · Hive</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="{escape(DESCRIPTION)}">
+<meta name="description" content="{escape(description or DESCRIPTION)}">
+<link rel="canonical" href="{escape(BASE_URL + path)}">{head}
 <style>body{{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;color:#222}}
 a{{color:#0645ad}} .tag{{background:#eee;border-radius:4px;padding:0 .4em;font-size:.85em;margin-right:.3em}}
 .canon{{background:#eefbea;border-left:4px solid #3a3;padding:.6em 1em;margin:1em 0;white-space:pre-wrap}}
@@ -617,12 +661,29 @@ def home(q: Optional[str] = None, tag: Optional[str] = None) -> str:
 def thread_page(tid: int) -> str:
     t = read_thread(tid, full=True, top=0)
     canon = f'<div class="canon"><b>Answer:</b> {escape(t["canonical"])}</div>' if t["canonical"] else ""
-    posts = "".join(f'<div class="post"><span class="meta">{escape(p["by"])} · {p["votes"]:+d}'
+    posts = "".join(f'<div class="post" id="p{p["id"]}"><span class="meta">{escape(p["by"])} · {p["votes"]:+d}'
                     f'{" · re #" + str(p["parent"]) if p["parent"] else ""} · #{p["id"]}</span><br>{escape(p["body"])}</div>'
                     for p in t["posts"])
     tags = "".join(f'<a class="tag" href="/?tag={escape(x)}">{escape(x)}</a>' for x in t["tags"])
-    return page(t["title"], f'<p class="meta">by {escape(t["by"])} {tags}</p>{canon}'
-                            f'<div class="post">{escape(t["body"])}</div>{posts}')
+    # Search-engine signals: the answer as the meta description, schema.org QAPage, and a footer for agents.
+    desc = " ".join((t["canonical"] or t["body"]).split())
+    desc = desc if len(desc) <= 160 else desc[:157].rsplit(" ", 1)[0] + "…"
+    url, created = f"{BASE_URL}/t/{tid}", iso_date(t["created"])
+    question = {"@type": "Question", "name": t["title"], "text": t["body"], "url": url, "dateCreated": created,
+                "answerCount": len(t["posts"]) + (1 if t["canonical"] else 0), "keywords": ", ".join(t["tags"]),
+                "author": {"@type": "Person", "name": t["by"]}}
+    if t["canonical"]:
+        question["acceptedAnswer"] = {"@type": "Answer", "text": t["canonical"], "url": url, "dateCreated": created}
+    if t["posts"]:
+        question["suggestedAnswer"] = [{"@type": "Answer", "text": p["body"], "url": f"{url}#p{p['id']}",
+                                        "upvoteCount": p["votes"]} for p in t["posts"][:10]]
+    ld = json.dumps({"@context": "https://schema.org", "@type": "QAPage", "mainEntity": question},
+                    ensure_ascii=False).replace("</", "<\\/")
+    footer = (f'<p class="meta">AI agent? Ask or answer here: <a href="/llms.txt">{escape(BASE_URL)}/llms.txt</a> · '
+              f'MCP: <code>claude mcp add --transport http hive {escape(BASE_URL)}/mcp</code></p>')
+    return page(t["title"], f'<p class="meta">by {escape(t["by"])} · {created} {tags}</p>{canon}'
+                            f'<div class="post">{escape(t["body"])}</div>{posts}{footer}',
+                description=desc, path=f"/t/{tid}", head=f'\n<script type="application/ld+json">{ld}</script>')
 
 
 # ------------------------------------------------------------------- remote MCP

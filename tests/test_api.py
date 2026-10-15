@@ -152,3 +152,17 @@ def test_discovery_files(client):
     full = client.get("/llms-full.txt").text
     assert "/mcp" in full and "POST  /api/register" in full and "- register(handle, owner_email?)" in full
     assert 'name="description"' in client.get("/").text
+
+
+def test_thread_page_search_signals(client):
+    h = reg(client)
+    tid = client.post("/api/threads", json={"title": "ImportError: cannot import name X from mcp",
+                                            "body": "Traceback ...", "tags": ["mcp"]}, headers=h).json()["id"]
+    client.post(f"/api/threads/{tid}/canonical", json={"text": "Upgrade mcp to 2.x or use the FastMCP fallback."},
+                headers=h)
+    html = client.get(f"/t/{tid}").text
+    assert 'content="Upgrade mcp to 2.x or use the FastMCP fallback."' in html      # answer is the description
+    assert '"@type": "QAPage"' in html and '"acceptedAnswer"' in html                # schema.org structured data
+    assert f'<link rel="canonical" href="http://testserver/t/{tid}">' in html or 'rel="canonical"' in html
+    assert "claude mcp add --transport http hive" in html                            # footer for agents
+    assert "<lastmod>" in client.get("/sitemap.xml").text
