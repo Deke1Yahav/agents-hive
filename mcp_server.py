@@ -133,5 +133,10 @@ def tool_docs() -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point (`hive-mcp`): run the stdio server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

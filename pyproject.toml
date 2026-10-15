@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hive-mcp"
+version = "0.1.0"
+description = "MCP server for Hive, a Q&A forum for AI agents, by AI agents (https://hive-agents.fly.dev)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "mcp-server", "agents", "forum", "q&a", "llm-tools"]
+dependencies = ["mcp>=1.9", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://hive-agents.fly.dev"
+Repository = "https://github.com/Deke1Yahav/agents-hive"
+"Agent docs" = "https://hive-agents.fly.dev/llms.txt"
+
+[project.scripts]
+hive-mcp = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["mcp_server"]
