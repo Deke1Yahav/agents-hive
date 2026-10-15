@@ -59,8 +59,10 @@ def test_thread_lifecycle_and_dedup(client):
     p = client.post(f"/api/threads/{tid}/posts", json={"body": "use tifffile.imread"}, headers=h)
     assert p.status_code == 201
     pid = p.json()["id"]
-    assert client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=h).json()["votes"] == 1
-    assert client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=h).json()["votes"] == 1  # idempotent
+    h2 = reg(client, "bot-b")
+    assert client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=h).status_code == 400  # own post
+    assert client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=h2).json()["votes"] == 1
+    assert client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=h2).json()["votes"] == 1  # idempotent
     assert client.post(f"/api/threads/{tid}/canonical", json={"text": "tifffile.imread keeps dtype"}, headers=h).status_code == 200
     t = client.get(f"/api/threads/{tid}").json()
     assert t["canonical"].startswith("tifffile") and t["tags"] == ["numpy", "tiff"] and t["posts"][0]["id"] == pid
@@ -246,6 +248,54 @@ def test_pinned_thread_first(client, monkeypatch):
     top = client.get("/api/threads").json()["threads"][0]
     assert top["id"] == first and top["pinned"] is True
     assert client.get("/").text.index("welcome howto") < client.get("/").text.index("newer unrelated")
+
+
+def test_reputation(client, monkeypatch):
+    import app as appmod
+    monkeypatch.setattr(appmod, "REP_VOTER_MIN_AGE", 0)
+    asker, helper, user = reg(client, "asker"), reg(client, "helper"), reg(client, "user")
+    tid = client.post("/api/threads", json={"title": "ValueError: zero-size array to reduction", "body": "b"},
+                      headers=asker).json()["id"]
+    # no canonical yet -> cannot confirm
+    assert client.post(f"/api/threads/{tid}/solved", headers=user).status_code == 400
+    client.post(f"/api/threads/{tid}/canonical", json={"text": "check for empty input first"}, headers=helper)
+    # the one who pinned it cannot confirm it; the asker and others can, once each
+    assert client.post(f"/api/threads/{tid}/solved", headers=helper).status_code == 400
+    assert client.post(f"/api/threads/{tid}/solved", headers=user).json() == {"confirmed": 1, "new": True}
+    assert client.post(f"/api/threads/{tid}/solved", headers=user).json() == {"confirmed": 1, "new": False}
+    assert client.post(f"/api/threads/{tid}/solved", headers=asker).json()["confirmed"] == 2
+    me = lambda h: client.get("/api/me", headers=h).json()
+    assert me(helper)["rep"] == 20 and me(asker)["rep"] == 2 and me(user)["rep"] == 0  # asker's own mark: no +2
+    assert client.get(f"/api/threads/{tid}").json()["confirmed"] == 2
+    assert client.get("/api/search", params={"q": "zero-size array"}).json()["hits"][0]["confirmed"] == 2
+    assert "confirmed by 2 agents" in client.get(f"/t/{tid}").text
+    # votes: +5 each, but one voter can move one agent by at most +30
+    for i in range(8):
+        pid = client.post(f"/api/threads/{tid}/posts", json={"body": f"detail {i}"}, headers=asker).json()["id"]
+        client.post(f"/api/posts/{pid}/vote", json={"value": 1}, headers=user)
+    assert me(asker)["rep"] == 30  # user's +2 solved mark and 8 x +5 votes share one cap of 30
+    # leaderboard and profile
+    board = client.get("/api/leaderboard").json()["agents"]
+    assert [a["handle"] for a in board] == ["asker", "helper"]
+    prof = client.get("/api/agents/helper").json()
+    assert prof["rep"] == 20 and prof["answers_pinned"] == 1 and prof["answers_confirmed"] == 2
+    assert "helper" in client.get("/leaderboard").text
+    # levels raise the write limit
+    assert appmod.level_of(0)["writes_per_hour"] == 30 and appmod.level_of(50)["level"] == "contributor"
+    assert me(asker)["next_level"] == "contributor" and me(asker)["next_at"] == 50
+    # replacing the answer resets confirmations; banning removes earned reputation
+    client.post(f"/api/threads/{tid}/canonical", json={"text": "different fix"}, headers=asker)
+    assert client.get(f"/api/threads/{tid}").json()["confirmed"] == 0
+    client.post("/api/admin/agents/asker/banned", headers={"X-API-Key": "admin-secret"})
+    assert [a["handle"] for a in client.get("/api/leaderboard").json()["agents"]] == []
+
+
+def test_reputation_ignores_fresh_voters(client):
+    a, b = reg(client, "old-agent"), reg(client, "fresh-agent")
+    tid = client.post("/api/threads", json={"title": "fresh voter test", "body": "b"}, headers=a).json()["id"]
+    client.post(f"/api/threads/{tid}/canonical", json={"text": "x"}, headers=a)
+    assert client.post(f"/api/threads/{tid}/solved", headers=b).json()["confirmed"] == 1  # counted as a signal
+    assert client.get("/api/me", headers=a).json()["rep"] == 0                            # but earns nothing yet
 
 
 def test_thread_page_search_signals(client):

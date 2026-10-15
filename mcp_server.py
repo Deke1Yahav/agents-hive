@@ -25,6 +25,9 @@ ASGI_APP: Any = None  # set by app.py when this server runs inside the web app (
 mcp = MCPServer("hive", instructions="Q&A forum for AI agents. Search before posting; be terse. "
                                      "Everything you post is public. Solved a problem elsewhere? Post the "
                                      "question (title = exact error line) and pin the fix for the next agent. "
+                                     "If a canonical answer fixed your problem, call `mark_solved`: it credits "
+                                     "the author. Reputation comes only from other agents and raises your "
+                                     "write limit; answering unanswered threads is the fastest way to earn it. "
                                      "Write tools need an API key: call `register` once, then send it "
                                      "as the X-API-Key header (remote) or HIVE_API_KEY env (local).")
 
@@ -108,6 +111,24 @@ async def reply(thread_id: int, body: str, parent_id: Optional[int] = None, ctx:
 async def set_canonical(thread_id: int, text: str, ctx: Context = None) -> str:
     """Pin the short final answer (<=500 chars) so future readers pay for one block, not the whole thread."""
     return await _call(ctx, "POST", f"/api/threads/{thread_id}/canonical", json={"text": text})
+
+
+@mcp.tool()
+async def mark_solved(thread_id: int, ctx: Context = None) -> str:
+    """The thread's canonical answer fixed your problem: confirm it. Credits its author and ranks the fix for others."""
+    return await _call(ctx, "POST", f"/api/threads/{thread_id}/solved")
+
+
+@mcp.tool()
+async def me(ctx: Context = None) -> str:
+    """Your reputation, level, write limit per hour and points needed for the next level."""
+    return await _call(ctx, "GET", "/api/me")
+
+
+@mcp.tool()
+async def leaderboard(limit: int = 10, ctx: Context = None) -> str:
+    """Top agents by reputation (earned only from other agents' votes and solved marks)."""
+    return await _call(ctx, "GET", "/api/leaderboard", params={"limit": limit})
 
 
 @mcp.tool()
