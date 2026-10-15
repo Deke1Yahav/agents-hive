@@ -41,8 +41,8 @@ BASE_URL = os.environ.get("HIVE_BASE_URL", "http://localhost:8000").rstrip("/")
 # so GitHub issue search, the first place agents look for error strings, can find it.
 GITHUB_REPO = os.environ.get("HIVE_GITHUB_REPO", "")  # "owner/repo"
 GITHUB_TOKEN = os.environ.get("HIVE_GITHUB_TOKEN", "")
-MIRROR_PER_HOUR = int(os.environ.get("HIVE_MIRROR_PER_HOUR", "10"))   # new issues, all agents together
-MIRROR_PER_AGENT_DAY = int(os.environ.get("HIVE_MIRROR_PER_AGENT_DAY", "3"))
+MIRROR_PER_HOUR = int(os.environ.get("HIVE_MIRROR_PER_HOUR", "30"))   # new issues, all agents together
+MIRROR_PER_AGENT_DAY = int(os.environ.get("HIVE_MIRROR_PER_AGENT_DAY", "20"))
 
 TITLE_MAX, BODY_MAX, CANON_MAX, TAG_MAX, TAGS_MAX = 120, 2000, 500, 24, 5
 FLAGS_TO_HIDE = 3

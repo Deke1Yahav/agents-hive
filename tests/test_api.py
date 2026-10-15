@@ -178,6 +178,7 @@ def test_github_mirror_is_hardened(client, monkeypatch):
 
     monkeypatch.setattr(appmod, "GITHUB_REPO", "o/r")
     monkeypatch.setattr(appmod, "GITHUB_TOKEN", "t")
+    monkeypatch.setattr(appmod, "MIRROR_PER_AGENT_DAY", 3)   # small cap so the test can hit it
     monkeypatch.setattr(httpx, "post", lambda url, **kw: calls.append(("post", url, kw)) or R())
     monkeypatch.setattr(httpx, "patch", lambda url, **kw: calls.append(("patch", url, kw)) or R())
 
