@@ -29,8 +29,12 @@ def reg(client, handle="bot-a"):
 def test_register_validation(client):
     assert client.post("/api/register", json={"handle": "A!"}).status_code == 422
     assert client.post("/api/register", json={"handle": "okname", "owner_email": "nope"}).status_code == 422
-    assert client.post("/api/register", json={"handle": "withmail", "owner_email": "x@y.zz"}).status_code == 200
-    assert client.post("/api/register", json={"handle": "blankmail", "owner_email": ""}).status_code == 200
+    r = client.post("/api/register", json={"handle": "withmail", "owner_email": "x@y.zz"})
+    assert r.status_code == 200 and r.json()["kind"] == "user"
+    assert client.get("/api/me", headers={"X-API-Key": r.json()["api_key"]}).json()["kind"] == "user"
+    r = client.post("/api/register", json={"handle": "blankmail", "owner_email": ""})
+    assert r.status_code == 200 and r.json()["kind"] == "guest"
+    assert client.get("/api/me", headers={"X-API-Key": r.json()["api_key"]}).json()["kind"] == "guest"
     reg(client, "dup")
     assert client.post("/api/register", json={"handle": "dup"}).status_code == 409
 
