@@ -166,6 +166,55 @@ def test_dedup_needs_real_overlap(client):
                        headers=h).status_code == 409
 
 
+def test_github_mirror_is_hardened(client, monkeypatch):
+    import httpx
+    import app as appmod
+    calls = []
+
+    class R:
+        status_code = 201
+        def json(self):
+            return {"number": 77}
+
+    monkeypatch.setattr(appmod, "GITHUB_REPO", "o/r")
+    monkeypatch.setattr(appmod, "GITHUB_TOKEN", "t")
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: calls.append(("post", url, kw)) or R())
+    monkeypatch.setattr(httpx, "patch", lambda url, **kw: calls.append(("patch", url, kw)) or R())
+
+    class SyncThread:  # run the app's background mirror threads inline so the test is deterministic
+        def __init__(self, target, args=(), daemon=None):
+            self.target, self.args = target, args
+        def start(self):
+            self.target(*self.args)
+    monkeypatch.setattr(appmod.threading, "Thread", SyncThread)
+    h = reg(client)
+    tid = client.post("/api/threads", json={"title": "evil @octocat  click https://x.y", "body": "hi @octocat",
+                                            "tags": ["spam-label"]}, headers=h).json()["id"]
+    appmod.mirror_to_github(tid)          # no canonical yet -> nothing
+    assert calls == []
+    client.post(f"/api/threads/{tid}/canonical", json={"text": "see [link](https://x.y) @octocat"}, headers=h)
+    kind, url, kw = calls[-1]
+    assert kind == "post" and url.endswith("/repos/o/r/issues")
+    assert kw["json"]["labels"] == ["hive"]                                  # tags never become labels
+    assert "```text\nsee [link](https://x.y) @octocat\n```" in kw["json"]["body"]  # user text is fenced
+    assert "```text\nhi @octocat\n```" in kw["json"]["body"]
+    # second time -> update, never a second issue
+    appmod.mirror_to_github(tid)
+    assert calls[-1][0] == "patch" and calls[-1][1].endswith("/issues/77")
+    # hidden by admin -> issue closed and blanked
+    monkeypatch.setattr(appmod, "ADMIN_KEY", "adm")
+    appmod.retract_from_github(tid)
+    assert calls[-1][2]["json"] == {"title": "[removed]", "body": "Removed from Hive by moderation.",
+                                    "state": "closed", "state_reason": "not_planned"}
+    # per-agent cap: a 4th new issue from the same agent is not posted
+    n = len(calls)
+    for i in range(4):
+        t2 = client.post("/api/threads", json={"title": f"q{i} totally different words {i}", "body": "b",
+                                               "force": True}, headers=h).json()["id"]
+        client.post(f"/api/threads/{t2}/canonical", json={"text": "a"}, headers=h)
+    assert len([c for c in calls[n:] if c[0] == "post"]) == 2            # 3/day per agent, 1 already used
+
+
 def test_thread_page_search_signals(client):
     h = reg(client)
     tid = client.post("/api/threads", json={"title": "ImportError: cannot import name X from mcp",

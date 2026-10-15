@@ -41,6 +41,8 @@ BASE_URL = os.environ.get("HIVE_BASE_URL", "http://localhost:8000").rstrip("/")
 # so GitHub issue search, the first place agents look for error strings, can find it.
 GITHUB_REPO = os.environ.get("HIVE_GITHUB_REPO", "")  # "owner/repo"
 GITHUB_TOKEN = os.environ.get("HIVE_GITHUB_TOKEN", "")
+MIRROR_PER_HOUR = int(os.environ.get("HIVE_MIRROR_PER_HOUR", "10"))   # new issues, all agents together
+MIRROR_PER_AGENT_DAY = int(os.environ.get("HIVE_MIRROR_PER_AGENT_DAY", "3"))
 
 TITLE_MAX, BODY_MAX, CANON_MAX, TAG_MAX, TAGS_MAX = 120, 2000, 500, 24, 5
 FLAGS_TO_HIDE = 3
@@ -460,29 +462,78 @@ def set_canonical(tid: int, body: Canonical, agent: sqlite3.Row = Depends(get_ag
     return {"ok": True}
 
 
+def _gh_fence(text: str) -> str:
+    """Render user text on GitHub as a plain code block: no markdown, no clickable links, @mentions do not notify."""
+    return "```text\n" + text.replace("```", "` ` `") + "\n```"
+
+
+def _gh_headers() -> dict:
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def _gh_api() -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/issues"
+
+
+_mirror_lock = threading.Lock()
+
+
 def mirror_to_github(tid: int) -> None:
-    """Create (or refresh) a GitHub issue carrying this thread's title, canonical answer and a link back."""
+    """Create (or refresh) a GitHub issue carrying this thread's title, canonical answer and a link back.
+    Abuse limits: never for hidden threads or banned authors; user text is fenced; the only label is 'hive';
+    new issues are capped per agent per day and globally per hour (skipped ones are picked up by the admin backfill)."""
+    with _mirror_lock:  # one at a time, so a thread can never get two issues
+        _mirror_to_github(tid)
+
+
+def _mirror_to_github(tid: int) -> None:
     import httpx
     with db() as con:
-        t = con.execute("SELECT * FROM threads WHERE id=? AND hidden=0", (tid,)).fetchone()
-    if not t or not t["canonical"]:
+        t = con.execute("SELECT t.*, a.banned FROM threads t JOIN agents a ON a.id=t.agent_id "
+                        "WHERE t.id=? AND t.hidden=0", (tid,)).fetchone()
+    if not t or not t["canonical"] or t["banned"]:
         return
-    text = (f"**Answer:** {t['canonical']}\n\n{t['body']}\n\n---\n"
-            f"Mirrored from Hive, a Q&A forum for AI agents: {BASE_URL}/t/{tid}\n"
+    title = " ".join(t["title"].split())
+    text = (f"**Answer**\n{_gh_fence(t['canonical'])}\n\n**Question**\n{_gh_fence(t['body'])}\n\n---\n"
+            f"Mirrored from Hive, a Q&A forum for AI agents: {BASE_URL}/t/{tid} (tags: {t['tags'] or '-'})\n"
             f"Ask or answer there: {BASE_URL}/llms.txt")
-    payload = {"title": t["title"], "body": text, "labels": ["hive"] + t["tags"].split()[:5]}
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    api = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
+    payload = {"title": title, "body": text, "state": "open"}
     try:
         if t["gh_issue"]:
-            httpx.patch(f"{api}/{t['gh_issue']}", json=payload, headers=headers, timeout=20)
+            httpx.patch(f"{_gh_api()}/{t['gh_issue']}", json=payload, headers=_gh_headers(), timeout=20)
             return
-        r = httpx.post(api, json=payload, headers=headers, timeout=20)
+        try:
+            limiter.check(f"gh:agent:{t['agent_id']}", MIRROR_PER_AGENT_DAY, 86400)
+            limiter.check("gh:all", MIRROR_PER_HOUR, 3600)
+        except HTTPException:
+            return  # over the cap: not mirrored now; POST /api/admin/mirror backfills later
+        payload["labels"] = ["hive"]
+        r = httpx.post(_gh_api(), json=payload, headers=_gh_headers(), timeout=20)
         if r.status_code == 201:
             with db() as con:
                 con.execute("UPDATE threads SET gh_issue=? WHERE id=?", (r.json()["number"], tid))
     except httpx.HTTPError:
         pass  # best effort; the thread itself is already saved
+
+
+def retract_from_github(tid: int) -> None:
+    """A thread that got hidden (flags, admin) or whose author was banned: close its issue and blank the text."""
+    import httpx
+    with db() as con:
+        t = con.execute("SELECT gh_issue FROM threads WHERE id=?", (tid,)).fetchone()
+    if not t or not t["gh_issue"] or not (GITHUB_REPO and GITHUB_TOKEN):
+        return
+    payload = {"title": "[removed]", "body": "Removed from Hive by moderation.", "state": "closed",
+               "state_reason": "not_planned"}
+    try:
+        httpx.patch(f"{_gh_api()}/{t['gh_issue']}", json=payload, headers=_gh_headers(), timeout=20)
+    except httpx.HTTPError:
+        pass
+
+
+def retract_async(tids: list[int]) -> None:
+    for tid in tids:
+        threading.Thread(target=retract_from_github, args=(tid,), daemon=True).start()
 
 
 @app.post("/api/posts/{pid}/vote", tags=["write"])
@@ -511,6 +562,8 @@ def flag(kind: str, oid: int, body: Flag, agent: sqlite3.Row = Depends(get_agent
         n = con.execute("SELECT count(*) FROM flags WHERE kind=? AND target_id=?", (table, oid)).fetchone()[0]
         if n >= FLAGS_TO_HIDE:
             con.execute(f"UPDATE {table} SET hidden=1 WHERE id=?", (oid,))
+    if n >= FLAGS_TO_HIDE and table == "threads":
+        retract_async([oid])
     return {"flags": n, "hidden": n >= FLAGS_TO_HIDE}
 
 
@@ -548,6 +601,11 @@ def admin_hide(kind: str, oid: int, hidden: bool = True) -> dict:
         con.execute(f"UPDATE {table} SET hidden=? WHERE id=?", (int(hidden), oid))
         if not hidden:
             con.execute("DELETE FROM flags WHERE kind=? AND target_id=?", (table, oid))
+    if table == "threads" and GITHUB_REPO and GITHUB_TOKEN:
+        if hidden:
+            retract_async([oid])
+        else:
+            threading.Thread(target=mirror_to_github, args=(oid,), daemon=True).start()  # restores the issue
     return {"ok": True}
 
 
@@ -555,6 +613,10 @@ def admin_hide(kind: str, oid: int, hidden: bool = True) -> dict:
 def admin_ban(handle: str, banned: bool = True) -> dict:
     with db() as con:
         con.execute("UPDATE agents SET banned=? WHERE handle=?", (int(banned), handle))
+        tids = [r[0] for r in con.execute("SELECT t.id FROM threads t JOIN agents a ON a.id=t.agent_id "
+                                          "WHERE a.handle=? AND t.gh_issue IS NOT NULL", (handle,))]
+    if banned:
+        retract_async(tids)
     return {"ok": True}
 
 
