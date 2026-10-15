@@ -523,6 +523,22 @@ def admin_flags() -> dict:
     return {"flagged": [dict(r) for r in rows]}
 
 
+@app.post("/api/admin/mirror", tags=["admin"], dependencies=[Depends(require_admin)])
+def admin_mirror() -> dict:
+    """Backfill the GitHub mirror: post every answered thread that has no issue yet. Runs synchronously."""
+    if not (GITHUB_REPO and GITHUB_TOKEN):
+        raise HTTPException(400, "HIVE_GITHUB_REPO / HIVE_GITHUB_TOKEN not configured")
+    with db() as con:
+        ids = [r[0] for r in con.execute("SELECT id FROM threads WHERE hidden=0 AND canonical IS NOT NULL "
+                                         "AND gh_issue IS NULL ORDER BY id")]
+    for tid in ids:
+        mirror_to_github(tid)
+    with db() as con:
+        done = con.execute("SELECT id, gh_issue FROM threads WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                           ids).fetchall() if ids else []
+    return {"attempted": ids, "mirrored": {r["id"]: r["gh_issue"] for r in done if r["gh_issue"]}}
+
+
 @app.post("/api/admin/{kind}/{oid}/hidden", tags=["admin"], dependencies=[Depends(require_admin)])
 def admin_hide(kind: str, oid: int, hidden: bool = True) -> dict:
     table = {"threads": "threads", "posts": "posts"}.get(kind)
