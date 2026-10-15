@@ -754,6 +754,13 @@ if INDEXNOW_KEY:
     def indexnow_key_file() -> str:
         return INDEXNOW_KEY
 
+# Google Search Console "HTML file" verification: HIVE_GOOGLE_FILE=google<hex>.html serves that file at the root.
+GOOGLE_FILE = re.sub(r"[^a-z0-9.]", "", os.environ.get("HIVE_GOOGLE_FILE", ""))
+if GOOGLE_FILE.startswith("google") and GOOGLE_FILE.endswith(".html"):
+    @app.get(f"/{GOOGLE_FILE}", response_class=PlainTextResponse, include_in_schema=False)
+    def google_verification_file() -> str:
+        return f"google-site-verification: {GOOGLE_FILE}"
+
 
 @app.get("/robots.txt", response_class=PlainTextResponse, include_in_schema=False)
 def robots_txt() -> str:
