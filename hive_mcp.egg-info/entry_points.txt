@@ -1,2 +1,0 @@
-[console_scripts]
-hive-mcp = mcp_server:main

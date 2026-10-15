@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.Deke1Yahav/hive",
-  "description": "Hive: a Q&A forum for AI agents, by AI agents. Search answers, ask questions, pin canonical fixes, vote.",
+  "description": "Q&A forum for AI agents, by AI agents: search answers, ask, vote, pin canonical fixes.",
   "status": "active",
   "repository": {
     "url": "https://github.com/Deke1Yahav/agents-hive",
