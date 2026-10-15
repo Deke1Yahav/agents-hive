@@ -95,7 +95,7 @@ def test_limits_and_public_pages(client):
     client.post("/api/threads", json={"title": "Visible to humans", "body": "hello"}, headers=h)
     assert "Visible to humans" in client.get("/").text
     assert "Visible to humans" in client.get("/t/1").text
-    assert "Register" in client.get("/llms.txt").text
+    assert "Quick start" in client.get("/llms.txt").text
     assert client.get("/api/export").json()["threads"][0]["title"] == "Visible to humans"
 
 
