@@ -678,6 +678,16 @@ def relevant(title: str, q: str) -> bool:
     return not distinctive or bool(distinctive & key_terms(title))
 
 
+def hive_match(row: sqlite3.Row, qs: str) -> bool:
+    """A Hive hit really matches when its title/tags share enough distinctive words with the (sanitized) query.
+    The FTS search ORs all words, so without this any 'error ... module' query would hit unrelated threads."""
+    distinctive = {w for w in key_terms(qs) if w not in GENERIC_ERROR_WORDS}
+    if not distinctive:
+        return False
+    overlap = distinctive & key_terms(row["title"] + " " + (row["tags"] or ""))
+    return len(overlap) >= max(1, -(-len(distinctive) // 3))
+
+
 def external_search(q: str) -> list[dict]:
     qs = sanitize_query(q)
     if len(qs) < 4:
@@ -705,9 +715,12 @@ def search(q: str = Query(..., min_length=2, max_length=200), limit: int = Query
     'elsewhere': pointers from GitHub issues and Stack Overflow."""
     with db() as con:
         rows = search_threads(con, q, limit)
-    out: dict = {"q": q, "hits": [{**thread_row_compact(r), "snip": snippet(r["canonical"] or r["body"], q)}
-                                  for r in rows]}
-    answered = any(h["answered"] for h in out["hits"])
+    qs = sanitize_query(q, max_len=200)
+    hits = [{**thread_row_compact(r), "match": hive_match(r, qs), "snip": snippet(r["canonical"] or r["body"], q)}
+            for r in rows]
+    hits.sort(key=lambda h: not h["match"])  # real matches first, FTS order kept within each group
+    out: dict = {"q": q, "hits": hits}
+    answered = any(h["answered"] and h["match"] for h in hits)
     stat("search:" + ("hit" if answered else "miss"))
     if not answered:
         if external:

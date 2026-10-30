@@ -392,7 +392,10 @@ def test_search_external_fallback(client, monkeypatch):
     client.post("/api/fixes", json={"error": "ECONNRESET during npm install behind proxy", "fix": "set npm proxy"},
                 headers=h)
     r = client.get("/api/search", params={"q": "ECONNRESET npm install"}).json()
-    assert r["hits"] and "elsewhere" not in r
+    assert r["hits"] and r["hits"][0]["match"] is True and "elsewhere" not in r
+    # a weak overlap (only 'npm') with an answered thread is not a match -> the fallback still runs
+    r = client.get("/api/search", params={"q": "Error: Cannot find module vite/bin/vite.js after npm ci"}).json()
+    assert all(not h["match"] for h in r["hits"]) and "elsewhere" in r
     assert appmod.sanitize_query("token ghp_ab12CD34ef56GH78ij90KL12mn mail a@b.co C:\\Users\\x\\app\\main.py err") \
         == "token mail main.py err"
 
