@@ -17,6 +17,8 @@ def client(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     hive.limiter.hits.clear()
+    monkeypatch.setattr(hive, "_ext_github", lambda q: [])         # tests never call GitHub / Stack Overflow;
+    monkeypatch.setattr(hive, "_ext_stackoverflow", lambda q: [])  # test_search_external_fallback stubs them itself
     with TestClient(hive.app) as c:
         yield c
 
@@ -335,6 +337,64 @@ def test_reputation_ignores_fresh_voters(client):
     client.post(f"/api/threads/{tid}/canonical", json={"text": "x"}, headers=a)
     assert client.post(f"/api/threads/{tid}/solved", headers=b).json()["confirmed"] == 1  # counted as a signal
     assert client.get("/api/me", headers=a).json()["rep"] == 0                            # but earns nothing yet
+
+
+def test_share_fix_one_call(client):
+    h = reg(client)
+    r = client.post("/api/fixes", json={"error": "TypeError: unhashable type 'list' in pandas groupby",
+                                        "fix": "Convert the list column to a tuple first: df[c] = df[c].map(tuple).",
+                                        "context": "pandas 2.2", "tags": ["pandas"]}, headers=h)
+    assert r.status_code == 201 and r.json()["merged_into_existing"] is False, r.text
+    t = client.get(f"/api/threads/{r.json()['id']}").json()
+    assert t["canonical"].startswith("Convert the list") and t["tags"] == ["pandas"]
+    # the same problem again: already answered -> 409 with the answer, no duplicate
+    r2 = client.post("/api/fixes", json={"error": "unhashable type 'list' pandas groupby TypeError", "fix": "use tuples"},
+                     headers=h)
+    assert r2.status_code == 409 and r2.json()["similar"][0]["id"] == t["id"]
+    # an existing UNANSWERED thread gets the fix pinned instead of a new thread
+    q = client.post("/api/threads", json={"title": "ModuleNotFoundError: No module named torchvision.ops in conda env",
+                                          "body": "stuck"}, headers=h).json()["id"]
+    r3 = client.post("/api/fixes", json={"error": "No module named torchvision.ops ModuleNotFoundError",
+                                         "fix": "Install a torchvision build matching torch."}, headers=reg(client, "bot-b"))
+    assert r3.status_code == 201 and r3.json() == {**r3.json(), "id": q, "merged_into_existing": True}
+    assert client.get(f"/api/threads/{q}").json()["canonical"].startswith("Install a torchvision")
+
+
+def test_self_reply_becomes_canonical(client):
+    h = reg(client)
+    tid = client.post("/api/threads", json={"title": "flaky hash of unittest output", "body": "b"}, headers=h).json()["id"]
+    r = client.post(f"/api/threads/{tid}/posts", json={"body": "still failing after trying X"}, headers=h).json()
+    assert "pinned_as_canonical" not in r and "set_canonical" in r["next"]
+    long_fix = "Answer: unittest writes its report to stderr. " + "Capture with 2>&1 and strip the timing line. " * 20
+    r = client.post(f"/api/threads/{tid}/posts", json={"body": long_fix}, headers=h).json()
+    assert r["pinned_as_canonical"] is True
+    canon = client.get(f"/api/threads/{tid}").json()["canonical"]
+    assert canon.startswith("Answer: unittest") and canon.endswith(f"(full answer: post #{r['id']})") and len(canon) <= 500
+    # someone else's reply never becomes the canonical answer
+    t2 = client.post("/api/threads", json={"title": "another unrelated question here", "body": "b"}, headers=h).json()["id"]
+    r = client.post(f"/api/threads/{t2}/posts", json={"body": "Fix: do Y"}, headers=reg(client, "bot-b")).json()
+    assert "pinned_as_canonical" not in r and client.get(f"/api/threads/{t2}").json()["canonical"] is None
+
+
+def test_search_external_fallback(client, monkeypatch):
+    import app as appmod
+    seen = []
+    monkeypatch.setattr(appmod, "_ext_github", lambda q: seen.append(q) or [
+        {"src": "github", "title": "ECONNRESET when installing", "url": "u1"},
+        {"src": "github", "title": "Unrelated generic error", "url": "u3"}])  # filtered: shares no distinctive word
+    monkeypatch.setattr(appmod, "_ext_stackoverflow", lambda q: [{"src": "stackoverflow", "title": "npm ECONNRESET", "url": "u2"}])
+    r = client.get("/api/search", params={"q": "ECONNRESET at /home/someone/proj/node_modules/x.js from 10.1.2.3"}).json()
+    assert [e["src"] for e in r["elsewhere"]] == ["stackoverflow", "github"] and "share_fix" in r["next"]
+    assert "/home/someone" not in seen[0] and "10.1.2.3" not in seen[0] and "x.js" in seen[0]  # sanitized
+    assert "elsewhere" not in client.get("/api/search", params={"q": "something else", "external": False}).json()
+    # an answered Hive match -> no external lookup
+    h = reg(client)
+    client.post("/api/fixes", json={"error": "ECONNRESET during npm install behind proxy", "fix": "set npm proxy"},
+                headers=h)
+    r = client.get("/api/search", params={"q": "ECONNRESET npm install"}).json()
+    assert r["hits"] and "elsewhere" not in r
+    assert appmod.sanitize_query("token ghp_ab12CD34ef56GH78ij90KL12mn mail a@b.co C:\\Users\\x\\app\\main.py err") \
+        == "token mail main.py err"
 
 
 def test_thread_page_search_signals(client):
