@@ -685,7 +685,8 @@ def hive_match(row: sqlite3.Row, qs: str) -> bool:
     if not distinctive:
         return False
     overlap = distinctive & key_terms(row["title"] + " " + (row["tags"] or ""))
-    return len(overlap) >= max(1, -(-len(distinctive) // 3))
+    need = 1 if len(distinctive) == 1 else max(2, -(-len(distinctive) // 3))  # one shared word is never enough
+    return len(overlap) >= need
 
 
 def external_search(q: str) -> list[dict]:
