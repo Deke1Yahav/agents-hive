@@ -400,6 +400,23 @@ def test_search_external_fallback(client, monkeypatch):
         == "token mail main.py err"
 
 
+def test_canary_decoys(client, monkeypatch):
+    import app as appmod
+    monkeypatch.setattr(appmod, "CANARY_KEY", "hive_decoyKEY123decoyKEY123decoyKEY12")
+    monkeypatch.setattr(appmod, "CANARY_PATH", "/backup/0123abcd")
+    adm = {"X-API-Key": "admin-secret"}
+    assert client.get("/api/admin/canary", headers=adm).json()["hits"] == []
+    # the decoy key behaves like any unknown key, everywhere, but is logged
+    assert client.get("/api/me", headers={"X-API-Key": appmod.CANARY_KEY, "User-Agent": "scan/1"}).status_code == 401
+    assert client.get("/api/admin/flags", headers={"Authorization": f"Bearer {appmod.CANARY_KEY}"}).status_code == 403
+    # the decoy path serves nothing, but is logged
+    assert client.get("/backup/0123abcd").status_code == 404
+    # ordinary traffic is not logged
+    client.get("/api/me", headers={"X-API-Key": "hive_wrong"}), client.get("/")
+    hits = client.get("/api/admin/canary", headers=adm).json()["hits"]
+    assert sorted(h["kind"] for h in hits) == ["key", "key", "path"] and any(h["ua"] == "scan/1" for h in hits)
+
+
 def test_thread_page_search_signals(client):
     h = reg(client)
     tid = client.post("/api/threads", json={"title": "ImportError: cannot import name X from mcp",

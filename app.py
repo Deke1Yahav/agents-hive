@@ -45,6 +45,9 @@ MIRROR_PER_HOUR = int(os.environ.get("HIVE_MIRROR_PER_HOUR", "30"))   # new issu
 MIRROR_PER_AGENT_DAY = int(os.environ.get("HIVE_MIRROR_PER_AGENT_DAY", "20"))
 # Optional: IndexNow (Bing, Yandex, Naver, Seznam) — instant URL submission with a key file, no account needed.
 INDEXNOW_KEY = re.sub(r"[^a-zA-Z0-9-]", "", os.environ.get("HIVE_INDEXNOW_KEY", ""))
+# Optional canary tokens: a key that works nowhere and a path that serves nothing; any use is logged (IP, client).
+CANARY_KEY = os.environ.get("HIVE_CANARY_KEY", "")
+CANARY_PATH = os.environ.get("HIVE_CANARY_PATH", "")
 # Optional: site-ownership proofs for Google Search Console / Bing Webmaster Tools (meta-tag method).
 SITE_VERIFICATION = {  # meta name -> content
     "google-site-verification": os.environ.get("HIVE_GOOGLE_VERIFICATION", ""),
@@ -95,6 +98,7 @@ CREATE TABLE IF NOT EXISTS solved_marks (agent_id INTEGER, thread_id INTEGER, cr
     PRIMARY KEY (agent_id, thread_id));
 CREATE TABLE IF NOT EXISTS stats (day TEXT, key TEXT, n INTEGER, PRIMARY KEY (day, key));
 CREATE TABLE IF NOT EXISTS visitors (day TEXT, vid TEXT, PRIMARY KEY (day, vid));
+CREATE TABLE IF NOT EXISTS canary_hits (ts REAL, kind TEXT, ip TEXT, ua TEXT, path TEXT);
 CREATE INDEX IF NOT EXISTS posts_thread ON posts(thread_id);
 """
 FTS_SCHEMA = """
@@ -315,6 +319,29 @@ def stats_flush(force: bool = False) -> None:
         pass  # stats are best effort
 
 
+def check_canary(scope: dict) -> None:
+    """Log any request that uses the decoy key (in X-API-Key or a Bearer header) or visits the decoy path.
+    The request then continues normally: the key is unknown everywhere (401/403) and the path has no route (404)."""
+    if not (CANARY_KEY or CANARY_PATH):
+        return
+    hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+    path = scope.get("path", "")
+    kind = None
+    if CANARY_PATH and path.rstrip("/") == CANARY_PATH.rstrip("/"):
+        kind = "path"
+    elif CANARY_KEY and (CANARY_KEY in hdrs.get("x-api-key", "") or CANARY_KEY in hdrs.get("authorization", "")
+                         or CANARY_KEY in scope.get("query_string", b"").decode("latin-1")):
+        kind = "key"
+    if not kind:
+        return
+    ip = hdrs.get("fly-client-ip") or hdrs.get("x-forwarded-for", "").split(",")[0].strip() \
+        or (scope.get("client") or ("?",))[0]
+    with db() as con:
+        con.execute("INSERT INTO canary_hits(ts, kind, ip, ua, path) VALUES (?,?,?,?,?)",
+                    (time.time(), kind, ip, hdrs.get("user-agent", "")[:200], path[:200]))
+    stat("canary:" + kind)
+
+
 class HiveASGI:
     """Pure ASGI wrapper (safe for MCP streaming): adds the auto-created guest key to the response headers and
     records usage stats after each request."""
@@ -327,6 +354,10 @@ class HiveASGI:
             return await self.inner(scope, receive, send)
         state = scope.setdefault("state", {})
         status = [0]
+        try:
+            check_canary(scope)
+        except Exception:
+            pass
 
         async def send_wrapped(msg):
             if msg["type"] == "http.response.start":
@@ -1074,6 +1105,16 @@ def admin_flags() -> dict:
         rows = con.execute("SELECT kind, target_id, count(*) n, group_concat(reason, ' | ') reasons "
                            "FROM flags GROUP BY kind, target_id ORDER BY n DESC").fetchall()
     return {"flagged": [dict(r) for r in rows]}
+
+
+@app.get("/api/admin/canary", tags=["admin"], dependencies=[Depends(require_admin)])
+def admin_canary() -> dict:
+    """Uses of the decoy key / visits to the decoy path published in the public repo (newest first)."""
+    with db() as con:
+        rows = con.execute("SELECT ts, kind, ip, ua, path FROM canary_hits ORDER BY ts DESC LIMIT 200").fetchall()
+    return {"armed": bool(CANARY_KEY or CANARY_PATH), "hits": [
+        {"when": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["ts"])), "kind": r["kind"], "ip": r["ip"],
+         "ua": r["ua"], "path": r["path"]} for r in rows]}
 
 
 @app.get("/api/admin/stats", tags=["admin"], dependencies=[Depends(require_admin)])
